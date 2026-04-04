@@ -3,28 +3,71 @@ const Tenant = require('../models/Tenant');
 const Company = require('../models/Company');
 const User = require('../models/User');
 const Vehicle = require('../models/Vehicle');
+const jwt = require('jsonwebtoken');
+
+const generateBridgeToken = (user, companyId) => {
+    return jwt.sign(
+        { 
+            id: user._id, 
+            company: companyId,
+            isSuperAdminProxy: true,
+            role: 'Admin'
+        }, 
+        process.env.SUPER_ADMIN_BRIDGE_SECRET || 'fallback_bridge_secret', 
+        { expiresIn: '1h' }
+    );
+};
 
 // @desc    Get all tenants
 // @route   GET /api/tenants
 // @access  Private (Super Admin)
 const getTenants = asyncHandler(async (req, res) => {
+    // 🛡️ ENHANCEMENT: Auto-sync ANY existing Companies from main DB that aren't in Tenants yet
+    try {
+        const existingCompanies = await Company.find({}).lean();
+        for (const company of existingCompanies) {
+            const tenantExists = await Tenant.findOne({ companyId: company._id });
+            if (!tenantExists) {
+                // Find an Admin for this company to populate the Tenant record
+                const adminUser = await User.findOne({ company: company._id, role: { $regex: /admin/i } }).sort({ createdAt: 1 }).lean();
+                
+                // Ensure email is unique for tenant creation
+                let finalEmail = adminUser?.username || `${company.name.toLowerCase().replace(/[^a-z0-9]/g, '')}@no-email.com`;
+                
+                // Check if this email already exists in Tenant collection
+                const emailInUse = await Tenant.findOne({ email: finalEmail });
+                if (emailInUse) {
+                    finalEmail = `alt-${Date.now()}-${finalEmail}`;
+                }
+
+                await Tenant.create({
+                    companyName: company.name,
+                    ownerName: company.ownerName || 'Unknown Admin',
+                    email: finalEmail,
+                    phone: adminUser?.mobile || '0000000000',
+                    adminEmail: adminUser?.username || 'admin@unmatched.com',
+                    adminPassword: 'SyncProtected123!', 
+                    status: company.status || 'active',
+                    companyId: company._id,
+                    adminUserId: adminUser?._id || null,
+                    vehicleLimit: company.vehicleLimit || 10,
+                    website: company.website || '',
+                    logo: company.logoUrl || ''
+                });
+                console.log(`[SYNC] Auto-migrated company "${company.name}" to Tenant record.`);
+            }
+        }
+    } catch (syncError) {
+        console.error('Critical Sync Error in getTenants:', syncError.message);
+    }
+
     const tenants = await Tenant.find({}).sort({ createdAt: -1 }).lean();
     
     // 🛡️ ENHANCEMENT: Populate LIVE counts from main database for each tenant
     const enhancedTenants = await Promise.all(tenants.map(async (tenant) => {
         if (tenant.companyId) {
-            // Count total internal (non-outside) vehicles for this company
-            const vCount = await Vehicle.countDocuments({ 
-                company: tenant.companyId,
-                isOutsideCar: false 
-            });
-            
-            // Count total Drivers for this company
-            const dCount = await User.countDocuments({
-                company: tenant.companyId,
-                role: 'Driver'
-            });
-
+            const vCount = await Vehicle.countDocuments({ company: tenant.companyId, isOutsideCar: false });
+            const dCount = await User.countDocuments({ company: tenant.companyId, role: 'Driver' });
             return { ...tenant, vehicleCount: vCount, driverCount: dCount };
         }
         return tenant;
@@ -324,10 +367,54 @@ const deleteTenant = asyncHandler(async (req, res) => {
     }
 });
 
+// @desc    Impersonate a tenant
+// @route   POST /api/tenants/:id/login-as
+// @access  Private/SuperAdmin
+const loginAsTenant = asyncHandler(async (req, res) => {
+    const tenant = await Tenant.findById(req.params.id);
+    if (!tenant) {
+        res.status(404);
+        throw new Error('Tenant not found');
+    }
+
+    // Find the matching company in the shared DB
+    const company = await Company.findById(tenant.companyId);
+    if (!company) {
+        res.status(404);
+        throw new Error('Matching CRM Company record not found');
+    }
+
+    console.log(`[BRIDGE-ATTEMPT] Impersonating: ${company.name} (Tenant: ${tenant._id})`);
+
+    // Find the root admin of this company
+    let adminUser = await User.findOne({ company: company._id, role: { $regex: /admin|executive/i } });
+    
+    // If no admin exists for this company, find any user
+    if (!adminUser) {
+        adminUser = await User.findOne({ company: company._id });
+    }
+
+    if (!adminUser) {
+        res.status(404);
+        throw new Error('No users found for this company in CRM database.');
+    }
+
+    const bridgeToken = generateBridgeToken(adminUser, company._id);
+    
+    // We'll return the CRM URL with the token
+    const crmUrl = process.env.CRM_FRONTEND_URL || 'http://localhost:5173';
+    
+    res.json({
+        token: bridgeToken,
+        redirectUrl: `${crmUrl}/bridge?token=${bridgeToken}`
+    });
+});
+
 module.exports = {
     getTenants,
     getTenantById,
     createTenant,
     updateTenant,
-    deleteTenant
+    deleteTenant,
+    loginAsTenant
 };

@@ -19,8 +19,35 @@ app.use(cors());
 app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
 
 // DB Connection
+const seedSuperAdmin = async () => {
+    try {
+        const email = 'admin@texi.com';
+        const password = '@2526Bigday';
+        
+        let admin = await SuperAdmin.findOne({ email });
+        if (!admin) {
+            await SuperAdmin.create({
+                name: 'System Controller',
+                email,
+                password
+            });
+            console.log(`--- SEED --- Created default Super Admin: ${email} / ${password}`);
+        } else {
+            // Force reset password for this admin to ensure user can login
+            admin.password = password;
+            await admin.save();
+            console.log(`--- SEED --- Ensured Super Admin credentials: ${email} / ${password}`);
+        }
+    } catch (err) {
+        console.error('Seed Error:', err);
+    }
+};
+
 mongoose.connect(process.env.MONGO_URI)
-.then(() => console.log('Super Admin MongoDB Connected'))
+.then(() => {
+    console.log('Super Admin MongoDB Connected');
+    seedSuperAdmin();
+})
 .catch(err => console.error('MongoDB Error:', err));
 
 // Define Dashboard Stats API here directly for simplicity
