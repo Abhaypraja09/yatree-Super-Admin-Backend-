@@ -22,53 +22,18 @@ const generateBridgeToken = (user, companyId) => {
 // @route   GET /api/tenants
 // @access  Private (Super Admin)
 const getTenants = asyncHandler(async (req, res) => {
-    // 🛡️ ENHANCEMENT: Auto-sync ANY existing Companies from main DB that aren't in Tenants yet
-    try {
-        const existingCompanies = await Company.find({}).lean();
-        for (const company of existingCompanies) {
-            const tenantExists = await Tenant.findOne({ companyId: company._id });
-            if (!tenantExists) {
-                // Find an Admin for this company to populate the Tenant record
-                const adminUser = await User.findOne({ company: company._id, role: { $regex: /admin/i } }).sort({ createdAt: 1 }).lean();
-                
-                // Ensure email is unique for tenant creation
-                let finalEmail = adminUser?.username || `${company.name.toLowerCase().replace(/[^a-z0-9]/g, '')}@no-email.com`;
-                
-                // Check if this email already exists in Tenant collection
-                const emailInUse = await Tenant.findOne({ email: finalEmail });
-                if (emailInUse) {
-                    finalEmail = `alt-${Date.now()}-${finalEmail}`;
-                }
-
-                await Tenant.create({
-                    companyName: company.name,
-                    ownerName: company.ownerName || 'Unknown Admin',
-                    email: finalEmail,
-                    phone: adminUser?.mobile || '0000000000',
-                    adminEmail: adminUser?.username || 'admin@unmatched.com',
-                    adminPassword: 'SyncProtected123!', 
-                    status: company.status || 'active',
-                    companyId: company._id,
-                    adminUserId: adminUser?._id || null,
-                    vehicleLimit: company.vehicleLimit || 10,
-                    website: company.website || '',
-                    logo: company.logoUrl || ''
-                });
-                console.log(`[SYNC] Auto-migrated company "${company.name}" to Tenant record.`);
-            }
-        }
-    } catch (syncError) {
-        console.error('Critical Sync Error in getTenants:', syncError.message);
-    }
-
     const tenants = await Tenant.find({}).sort({ createdAt: -1 }).lean();
     
     // 🛡️ ENHANCEMENT: Populate LIVE counts from main database for each tenant
     const enhancedTenants = await Promise.all(tenants.map(async (tenant) => {
         if (tenant.companyId) {
-            const vCount = await Vehicle.countDocuments({ company: tenant.companyId, isOutsideCar: false });
-            const dCount = await User.countDocuments({ company: tenant.companyId, role: 'Driver' });
-            return { ...tenant, vehicleCount: vCount, driverCount: dCount };
+            try {
+                const vCount = await Vehicle.countDocuments({ company: tenant.companyId, isOutsideCar: false });
+                const dCount = await User.countDocuments({ company: tenant.companyId, role: 'Driver' });
+                return { ...tenant, vehicleCount: vCount, driverCount: dCount };
+            } catch (err) {
+                return { ...tenant, vehicleCount: 0, driverCount: 0 };
+            }
         }
         return tenant;
     }));
@@ -97,7 +62,7 @@ const createTenant = asyncHandler(async (req, res) => {
     console.log('REQ FILES:', req.files);
 
     let {
-        companyName, ownerName, phone,
+        companyName, ownerName, phone, whatsappNumber,
         adminEmail, adminPassword, plan, monthlyFee,
         trialDays, permissions, vehicleLimit, website
     } = req.body;
@@ -146,6 +111,7 @@ const createTenant = asyncHandler(async (req, res) => {
         company.logoUrl = logoUrl || company.logoUrl || '';
         company.ownerSignatureUrl = signatureUrl || company.ownerSignatureUrl || '';
         company.ownerName = ownerName || company.ownerName || '';
+        company.whatsappNumber = whatsappNumber || phone || company.whatsappNumber || '916367466426';
         await company.save();
     } else {
         company = await Company.create({
@@ -155,7 +121,8 @@ const createTenant = asyncHandler(async (req, res) => {
             website: website || '',
             logoUrl: logoUrl,
             ownerSignatureUrl: signatureUrl,
-            ownerName: ownerName || ''
+            ownerName: ownerName || '',
+            whatsappNumber: whatsappNumber || phone || '916367466426'
         });
     }
 
@@ -215,6 +182,7 @@ const createTenant = asyncHandler(async (req, res) => {
         tenant.ownerName = ownerName || tenant.ownerName;
         tenant.email = email;
         tenant.phone = phone || tenant.phone;
+        tenant.whatsappNumber = whatsappNumber || tenant.whatsappNumber;
         tenant.adminEmail = adminEmail;
         tenant.adminPassword = adminPassword;
         tenant.plan = plan || tenant.plan;
@@ -234,6 +202,7 @@ const createTenant = asyncHandler(async (req, res) => {
             ownerName: ownerName || 'Admin',
             email,
             phone: phone || '0000000000',
+            whatsappNumber: whatsappNumber || '',
             adminEmail,
             adminPassword,
             plan: plan || 'trial',
@@ -296,6 +265,8 @@ const updateTenant = asyncHandler(async (req, res) => {
 
         tenant.companyName = req.body.companyName || tenant.companyName;
         tenant.ownerName = req.body.ownerName || tenant.ownerName;
+        tenant.phone = req.body.phone || tenant.phone;
+        tenant.whatsappNumber = req.body.whatsappNumber || tenant.whatsappNumber;
         tenant.status = req.body.status || tenant.status;
         tenant.plan = req.body.plan || tenant.plan;
         tenant.monthlyFee = req.body.monthlyFee ?? Number(tenant.monthlyFee);
@@ -321,17 +292,36 @@ const updateTenant = asyncHandler(async (req, res) => {
                     user.permissions = permissions;
                     tenant.permissions = permissions;
                 }
-                if (req.body.vehicleLimit || req.body.website || req.files || req.body.ownerName) {
+                if (req.body.phone) {
+                    user.mobile = req.body.phone;
+                }
+                if (req.body.vehicleLimit || req.body.website || req.files || req.body.ownerName || req.body.phone) {
                     user.vehicleLimit = Number(req.body.vehicleLimit) || user.vehicleLimit;
                     // Also update company record
+                    // 🛡️ RECOVERY: If companyId is missing, try to find it by name (Fuzzy/Case-insensitive)
+                    if (!tenant.companyId) {
+                        const foundCompany = await Company.findOne({ 
+                            name: { $regex: new RegExp(`^${tenant.companyName.split(' ')[0]}`, 'i') } 
+                        });
+                        if (foundCompany) {
+                            tenant.companyId = foundCompany._id;
+                            console.log(`[RECOVERY] Linked tenant "${tenant.companyName}" to companyId: ${foundCompany._id} (Match: ${foundCompany.name})`);
+                        } else {
+                            console.log(`[RECOVERY-FAILED] No company found matching "${tenant.companyName}"`);
+                        }
+                    }
+
                     if (tenant.companyId) {
-                        await Company.findByIdAndUpdate(tenant.companyId, { 
+                        const updatedComp = await Company.findByIdAndUpdate(tenant.companyId, { 
+                            status: req.body.status || tenant.status,
                             vehicleLimit: Number(req.body.vehicleLimit) || tenant.vehicleLimit,
                             website: req.body.website ?? tenant.website,
-                            logoUrl: logoUrl,
-                            ownerSignatureUrl: signatureUrl,
-                            ownerName: req.body.ownerName ?? tenant.ownerName
-                        });
+                            logoUrl: logoUrl || (tenant.companyId ? (await Company.findById(tenant.companyId))?.logoUrl : ''),
+                            ownerSignatureUrl: signatureUrl || (tenant.companyId ? (await Company.findById(tenant.companyId))?.ownerSignatureUrl : ''),
+                            ownerName: req.body.ownerName ?? tenant.ownerName,
+                            whatsappNumber: req.body.whatsappNumber ?? tenant.whatsappNumber ?? tenant.phone
+                        }, { new: true });
+                        console.log(`[SYNC] Updated Company "${tenant.companyName}" (ID: ${tenant.companyId}) status to: ${updatedComp?.status}`);
                     }
                 }
                 await user.save();
@@ -350,17 +340,19 @@ const updateTenant = asyncHandler(async (req, res) => {
 // @route   DELETE /api/tenants/:id
 // @access  Private (Super Admin)
 const deleteTenant = asyncHandler(async (req, res) => {
-    const tenant = await Tenant.findById(req.params.id);
+    const tenantId = req.params.id;
+    const tenant = await Tenant.findById(tenantId);
 
     if (tenant) {
-        // Option to delete company/user as well if requested
-        // For security, just delete the tenant tracking record and mark company as suspended
+        // Suspend the associated company if it exists
         if (tenant.companyId) {
             await Company.findByIdAndUpdate(tenant.companyId, { status: 'suspended' });
         }
 
-        await tenant.deleteOne();
-        res.json({ message: 'Tenant record removed and client suspended' });
+        // Use findByIdAndDelete for maximum reliability
+        await Tenant.findByIdAndDelete(tenantId);
+        
+        res.json({ message: 'Tenant record removed and client suspended successfully' });
     } else {
         res.status(404);
         throw new Error('Tenant not found');

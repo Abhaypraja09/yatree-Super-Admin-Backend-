@@ -6,6 +6,7 @@ const tenantSchema = new mongoose.Schema({
     ownerName: { type: String, required: true },
     email: { type: String, unique: true, lowercase: true, sparse: true },
     phone: { type: String, required: true },
+    whatsappNumber: { type: String, default: '' },
     address: { type: String, default: '' },
     logo: { type: String, default: '' },
     website: { type: String, default: '' },
